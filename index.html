@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Plate Check">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="robots" content="noindex, nofollow">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>NWC Plate Check</title>
+<script>
+/* ===== SETTINGS - paste your Google Apps Script web app URL here ===== */
+window.PLATE_CHECK_CONFIG = {
+  API_URL: 'https://script.google.com/macros/s/AKfycbyX_N5bboS29t1N3tyEhzaMs8kzdZfKd29LBtyEWIYBlunJEp7Xsl_JLnk5tvo9LVNqcA/exec'
+};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<style>
+:root{
+  --bg:#efece6; --surface:#ffffff; --text:#1d1a17; --muted:#6b645c; --line:#d6d0c6;
+  --accent:#5b1a2e; --accent-text:#ffffff;
+  --ok:#1f6e3a; --ok-bg:#e1f1e6; --bad:#a3271d; --bad-bg:#f8e3e0; --warn:#7a5a00; --warn-bg:#fbf0d0;
+  --detect:#2fbf5b;
+  color-scheme: light;
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#1a1716; --surface:#262220; --text:#f1ece6; --muted:#a89f95; --line:#3d3733;
+    --accent:#c4587a; --accent-text:#ffffff;
+    --ok:#7fd69a; --ok-bg:#1f3a28; --bad:#f19a90; --bad-bg:#46211d; --warn:#f0cf73; --warn-bg:#3d3216;
+    color-scheme: dark;
+  }
+}
+*,*::before,*::after{box-sizing:border-box}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--text);
+  font:16px/1.45 -apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px}
+header{margin:4px 0 14px}
+h1{font-size:1.35rem;margin:0;letter-spacing:-.01em}
+.cam{position:relative;width:100%;aspect-ratio:3/4;background:#000;border-radius:14px;overflow:hidden}
+.cam video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.guide{position:absolute;left:8%;width:84%;top:38%;height:22%;
+  border:3px solid #fff;border-radius:10px;box-shadow:0 0 0 2000px rgba(0,0,0,.35);
+  transition:border-color .15s, background-color .15s}
+.guide.detect{border-color:var(--detect)}
+.guide.locked{border-color:var(--detect);background:rgba(47,191,91,.2)}
+.start{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:10px;color:#fff;text-align:center;padding:24px}
+.status{margin:10px 2px 0;min-height:1.45em;color:var(--muted)}
+button{font:inherit;border-radius:10px;border:0;padding:12px 18px;cursor:pointer}
+.primary{background:var(--accent);color:var(--accent-text);font-weight:600}
+.secondary{background:var(--surface);color:var(--text);border:1px solid var(--line)}
+button:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.row{display:flex;gap:8px;margin-top:14px}
+.row input{flex:1;min-width:0;padding:12px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:var(--text);font:inherit}
+#plateInput{font:600 1.15rem/1 "DIN Alternate","Helvetica Neue",Arial,sans-serif;letter-spacing:.08em;text-transform:uppercase}
+.result{margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px}
+.plate{display:inline-block;background:#fff;color:#111;border:3px solid #111;border-radius:8px;
+  padding:6px 16px;font:700 2rem/1 "DIN Alternate","DIN Condensed","Helvetica Neue",Arial,sans-serif;letter-spacing:.12em}
+.verdict{margin-top:14px;padding:12px 14px;border-radius:10px;font-weight:700;font-size:1.25rem}
+.verdict.yes{background:var(--ok-bg);color:var(--ok)}
+.verdict.no{background:var(--bad-bg);color:var(--bad)}
+.verdict.warn{background:var(--warn-bg);color:var(--warn)}
+dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:14px 0 0}
+dt{color:var(--muted)} dd{margin:0;font-weight:600}
+.note{font-size:.88rem;color:var(--muted);margin:10px 0 0}
+details{margin-top:18px;color:var(--muted);font-size:.92rem}
+summary{cursor:pointer;padding:6px 0}
+#debug{width:100%;margin-top:8px;border-radius:8px;background:#fff}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <header><h1>NWC Plate Check</h1></header>
+
+  <div class="cam" id="cam">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="guide hidden" id="guide"></div>
+    <div class="start" id="startPanel">
+      <p>Line the number plate up inside the rectangle. It turns green when a plate is found.</p>
+      <button class="primary" id="startBtn">Start camera</button>
+    </div>
+  </div>
+  <p class="status" id="status" aria-live="polite"></p>
+  <div class="row"><button class="secondary hidden" id="againBtn">Scan next plate</button></div>
+
+  <div class="row">
+    <input id="plateInput" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="Type a plate" aria-label="Registration plate">
+    <button class="primary" id="checkBtn">Check</button>
+  </div>
+
+  <section class="result hidden" id="result" aria-live="polite"></section>
+
+  <details id="settings">
+    <summary>Settings</summary>
+    <p>Enter the access key once on each device. Your manager can give you the key.</p>
+    <div class="row">
+      <input id="keyInput" type="password" autocomplete="off" placeholder="Access key" aria-label="Access key">
+      <button class="primary" id="saveKeyBtn">Save</button>
+    </div>
+    <div class="row"><button class="secondary" id="testBtn">Test connection</button></div>
+    <p class="note" id="settingsMsg"></p>
+    <p class="note"><label><input type="checkbox" id="debugToggle"> Show what the reader sees</label></p>
+    <canvas id="debug" class="hidden"></canvas>
+  </details>
+</main>
+
+<script>
+(function(){
+'use strict';
+const CONFIG = window.PLATE_CHECK_CONFIG || {};
+const $ = id => document.getElementById(id);
+const video=$('video'), guide=$('guide'), statusEl=$('status'), resultEl=$('result');
+const input=$('plateInput'), debugCanvas=$('debug');
+let scanning=false, stream=null, history=[], ocrBusy=false;
+
+function setStatus(t){ statusEl.textContent=t; }
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function cleanPlate(s){ return String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,''); }
+
+/* ---------- Access key (stored on this device only) ---------- */
+function getKey(){ try{ return localStorage.getItem('plateCheckKey')||''; }catch(e){ return ''; } }
+function setKey(k){ try{ localStorage.setItem('plateCheckKey',k); return true; }catch(e){ return false; } }
+
+async function callApi(params){
+  if(!CONFIG.API_URL || /^PASTE_/.test(CONFIG.API_URL)) return {error:'not_configured'};
+  const key=getKey(); if(!key) return {error:'no_key'};
+  const q=new URLSearchParams(Object.assign({key}, params)).toString();
+  try{
+    const r=await fetch(CONFIG.API_URL+'?'+q, {method:'GET', redirect:'follow', cache:'no-store'});
+    return await r.json();
+  }catch(e){ return {error:'network'}; }
+}
+
+const ERRORS={
+  not_configured:'The app isn’t connected to the permit list yet. The web app URL needs to be added to the app settings file.',
+  no_key:'Enter the access key in Settings (below) before checking plates.',
+  unauthorised:'The access key is missing or wrong. Re-enter it in Settings.',
+  network:'Couldn’t reach the permit list. Check the phone has signal or Wi-Fi, then try again.',
+  busy:'Too many checks in the last minute. Wait a moment and try again.',
+  setup:'The permit list isn’t set up correctly (sheet tab or column names). Check the script settings.',
+  bad_plate:'That doesn’t look like a plate. Check the reading and try again.'
+};
+
+async function showResult(plate){
+  const p=cleanPlate(plate);
+  if(!p){ resultEl.classList.add('hidden'); return; }
+  resultEl.innerHTML='<span class="plate">'+esc(p)+'</span><p class="note">Checking…</p>';
+  resultEl.classList.remove('hidden');
+  const r=await callApi({plate:p});
+  let html='<span class="plate">'+esc(p)+'</span>';
+  if(r.error){
+    html+='<div class="verdict warn">Not checked</div><p class="note">'+esc(ERRORS[r.error]||('Error: '+r.error))+'</p>';
+    if(r.error==='no_key'||r.error==='unauthorised') $('settings').open=true;
+  } else if(r.ambiguous){
+    html+='<div class="verdict warn">Check manually</div><p class="note">More than one registration looks like this reading ('+esc((r.candidates||[]).join(', '))+'). Look at the plate and type it in exactly.</p>';
+  } else if(r.issued){
+    html+='<div class="verdict yes">Permit issued: YES</div><dl><dt>Parking area</dt><dd>'+esc(r.area)+'</dd><dt>Permit owner</dt><dd>'+esc(r.owner)+'</dd></dl>';
+    if(!r.exact) html+='<p class="note">Matched registration <strong>'+esc(r.plate)+'</strong> (letters and numbers that look alike, such as O and 0). Check the plate on the car is '+esc(r.plate)+' before relying on this.</p>';
+  } else {
+    html+='<div class="verdict no">Permit issued: NO</div><dl><dt>Parking area</dt><dd>N/A</dd><dt>Permit owner</dt><dd>N/A</dd></dl><p class="note">If the reading is wrong, correct it above and tap Check.</p>';
+  }
+  resultEl.innerHTML=html;
+}
+
+$('checkBtn').addEventListener('click', ()=>{ input.value=cleanPlate(input.value); showResult(input.value); });
+input.addEventListener('keydown', e=>{ if(e.key==='Enter'){ input.value=cleanPlate(input.value); showResult(input.value); }});
+$('saveKeyBtn').addEventListener('click', ()=>{
+  const k=$('keyInput').value.trim();
+  $('settingsMsg').textContent = k ? (setKey(k)?'Key saved on this device.':'Couldn’t save the key on this device.') : 'Enter a key first.';
+  $('keyInput').value='';
+});
+$('testBtn').addEventListener('click', async ()=>{
+  $('settingsMsg').textContent='Testing…';
+  const r=await callApi({ping:'1'});
+  $('settingsMsg').textContent = r.ok ? 'Connected to the permit list.' : (ERRORS[r.error]||'Connection failed.');
+});
+$('debugToggle').addEventListener('change', e=>debugCanvas.classList.toggle('hidden', !e.target.checked));
+$('againBtn').addEventListener('click', ()=>{
+  history=[]; resultEl.classList.add('hidden'); input.value='';
+  guide.classList.remove('locked','detect'); $('againBtn').classList.add('hidden');
+  scanning=true; setStatus('Line the plate up inside the rectangle.'); loop();
+});
+
+/* ---------- Camera ---------- */
+$('startBtn').addEventListener('click', async ()=>{
+  setStatus('Starting camera…');
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    setStatus('This browser can’t use the camera. Type the plate below instead.'); return;
+  }
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:false, video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}});
+    video.srcObject=stream;
+    $('startPanel').classList.add('hidden'); guide.classList.remove('hidden');
+    try{ await video.play(); }catch(e){}
+    getWorker();
+    scanning=true; setStatus('Line the plate up inside the rectangle.');
+    loop();
+  }catch(err){
+    setStatus('Camera didn’t start ('+(err&&err.name||'error')+'). Allow camera access for this app, or type the plate below.');
+  }
+});
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && stream){ video.play().catch(()=>{}); if(scanning) loop(); } });
+
+/* ---------- Text recognition engine (runs on the phone) ---------- */
+let workerPromise=null;
+function getWorker(){
+  if(!workerPromise){
+    if(!window.Tesseract){ workerPromise=Promise.reject(new Error('reader not loaded')); return workerPromise; }
+    workerPromise=(async()=>{
+      const w=await Tesseract.createWorker('eng', 1);
+      await w.setParameters({
+        tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        tessedit_pageseg_mode:'7',
+        user_defined_dpi:'300'
+      });
+      return w;
+    })();
+    workerPromise.catch(()=>setStatus('The plate reader didn’t load. Check signal and reopen the app, or type plates manually.'));
+  }
+  return workerPromise;
+}
+
+/* ---------- Plate detection (finds the characters inside the rectangle) ---------- */
+function otsu(gray){
+  const hist=new Array(256).fill(0); for(const v of gray) hist[v]++;
+  const total=gray.length; let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
+  let sumB=0,wB=0,max=0,thr=128;
+  for(let t=0;t<256;t++){
+    wB+=hist[t]; if(!wB) continue; const wF=total-wB; if(!wF) break;
+    sumB+=t*hist[t]; const mB=sumB/wB, mF=(sum-sumB)/wF, b=wB*wF*(mB-mF)*(mB-mF);
+    if(b>max){ max=b; thr=t; }
+  }
+  return thr;
+}
+function findChars(bin,W,H){
+  const labels=new Int32Array(W*H), comps=[]; let next=1; const stack=[];
+  for(let i=0;i<W*H;i++){
+    if(!bin[i]||labels[i]) continue;
+    let x0=W,y0=H,x1=-1,y1=-1,area=0; labels[i]=next; stack.push(i);
+    while(stack.length){
+      const p=stack.pop(), x=p%W, y=(p/W)|0; area++;
+      if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y;
+      for(let dy=-1;dy<=1;dy++) for(let dx=-1;dx<=1;dx++){
+        const nx=x+dx, ny=y+dy; if(nx<0||ny<0||nx>=W||ny>=H) continue;
+        const q=ny*W+nx; if(bin[q]&&!labels[q]){ labels[q]=next; stack.push(q); }
+      }
+    }
+    comps.push({x0,y0,x1,y1,w:x1-x0+1,h:y1-y0+1,area}); next++;
+  }
+  const cand=comps.filter(c =>
+    c.h>=H*0.25 && c.h<=H*0.95 && c.w>=W*0.01 && c.w<=W*0.25 && c.w<=c.h*1.2 &&
+    c.area/(c.w*c.h)>0.12 && c.area/(c.w*c.h)<0.95 &&
+    c.x0>0 && c.y0>0 && c.x1<W-1 && c.y1<H-1);
+  let group=[];
+  for(const s of cand){
+    const g=cand.filter(c=>Math.abs(c.h-s.h)<0.2*s.h && Math.abs((c.y0+c.y1)/2-(s.y0+s.y1)/2)<0.3*s.h);
+    if(g.length>group.length) group=g;
+  }
+  group.sort((a,b)=>a.x0-b.x0);
+  return {cand, group};
+}
+
+const work=document.createElement('canvas'), wctx=work.getContext('2d',{willReadFrequently:true});
+const crop=document.createElement('canvas'), cctx=crop.getContext('2d',{willReadFrequently:true});
+
+function detect(){
+  const vw=video.videoWidth, vh=video.videoHeight; if(!vw||!vh) return null;
+  const cr=$('cam').getBoundingClientRect(), gr=guide.getBoundingClientRect();
+  const scale=Math.max(cr.width/vw, cr.height/vh);
+  const offX=(cr.width-vw*scale)/2, offY=(cr.height-vh*scale)/2;
+  const sx=(gr.left-cr.left-offX)/scale, sy=(gr.top-cr.top-offY)/scale, sw=gr.width/scale, sh=gr.height/scale;
+  const W=360, H=Math.max(40,Math.round(W*sh/sw));
+  work.width=W; work.height=H; wctx.drawImage(video,sx,sy,sw,sh,0,0,W,H);
+  const d=wctx.getImageData(0,0,W,H).data, gray=new Uint8Array(W*H);
+  let mn=255,mx=0;
+  for(let i=0;i<W*H;i++){ const v=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0; gray[i]=v; if(v<mn)mn=v; if(v>mx)mx=v; }
+  if(mx-mn<50) return {group:[]};
+  const thr=otsu(gray);
+  let best=null, dark=true;
+  for(const darkText of [true,false]){
+    const bin=new Uint8Array(W*H); for(let i=0;i<W*H;i++) bin[i]=darkText ? gray[i]<thr : gray[i]>thr;
+    const r=findChars(bin,W,H);
+    if(!best || r.group.length>best.group.length){ best=r; dark=darkText; }
+    if(r.group.length>=3) break;
+  }
+  const ok=best.group.length>=2 && best.group.length<=9;
+  if(!ok) return {group:best.group};
+  // Bounding box around the characters, mapped back to full camera resolution
+  let x0=W,y0=H,x1=0,y1=0;
+  for(const c of best.group){ x0=Math.min(x0,c.x0); y0=Math.min(y0,c.y0); x1=Math.max(x1,c.x1); y1=Math.max(y1,c.y1); }
+  const pad=(y1-y0)*0.25, kx=sw/W, ky=sh/H;
+  return {group:best.group, dark, src:{
+    x:sx+Math.max(0,x0-pad)*kx, y:sy+Math.max(0,y0-pad)*ky,
+    w:(Math.min(W,x1+pad)-Math.max(0,x0-pad))*kx, h:(Math.min(H,y1+pad)-Math.max(0,y0-pad))*ky }};
+}
+
+function prepareCrop(src, dark){
+  const targetH=110, scale=targetH/src.h, cw=Math.round(src.w*scale);
+  crop.width=cw; crop.height=targetH;
+  cctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, cw, targetH);
+  const img=cctx.getImageData(0,0,cw,targetH), d=img.data, gray=new Uint8Array(cw*targetH);
+  for(let i=0;i<gray.length;i++) gray[i]=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0;
+  const thr=otsu(gray);
+  for(let i=0;i<gray.length;i++){
+    const isText = dark ? gray[i]<thr : gray[i]>thr;
+    const v=isText?0:255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
+  }
+  cctx.putImageData(img,0,0);
+  // white margin helps the reader
+  const out=document.createElement('canvas'); out.width=cw+40; out.height=targetH+40;
+  const o=out.getContext('2d'); o.fillStyle='#fff'; o.fillRect(0,0,out.width,out.height); o.drawImage(crop,20,20);
+  if(!debugCanvas.classList.contains('hidden')){ debugCanvas.width=out.width; debugCanvas.height=out.height; debugCanvas.getContext('2d').drawImage(out,0,0); }
+  return out;
+}
+
+async function recognise(canvas){
+  const w=await getWorker();
+  const {data}=await w.recognize(canvas);
+  return {text:cleanPlate(data.text), conf:data.confidence||0};
+}
+
+function loop(){
+  if(!scanning || document.hidden) return;
+  const f=detect();
+  if(f){
+    const detected=!!f.src;
+    guide.classList.toggle('detect', detected);
+    if(detected && !ocrBusy){
+      ocrBusy=true;
+      const c=prepareCrop(f.src, f.dark);
+      recognise(c).then(r=>{
+        ocrBusy=false;
+        if(!scanning) return;
+        if(r.text.length>=2 && r.text.length<=8 && r.conf>=55){
+          setStatus('Reading '+r.text+'…');
+          history.push(r.text); if(history.length>4) history.shift();
+          if(history.filter(t=>t===r.text).length>=2) lock(r.text);
+        }
+      }).catch(()=>{ ocrBusy=false; });
+    }
+    if(!detected && !ocrBusy) setStatus('Line the plate up inside the rectangle.');
+  }
+  setTimeout(loop,150);
+}
+
+function lock(text){
+  scanning=false; guide.classList.add('locked');
+  input.value=text; setStatus('Read '+text+'. Check it matches the plate - correct it below if not.');
+  $('againBtn').classList.remove('hidden');
+  showResult(text);
+}
+
+if(!getKey()) setStatus('First time on this device? Enter the access key in Settings below.');
+})();
+</script>
+</body>
+</html>
