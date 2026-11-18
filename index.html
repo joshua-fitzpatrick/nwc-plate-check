@@ -184,7 +184,7 @@ $('testBtn').addEventListener('click', async ()=>{
 });
 $('debugToggle').addEventListener('change', e=>debugCanvas.classList.toggle('hidden', !e.target.checked));
 $('againBtn').addEventListener('click', ()=>{
-  history=[]; resultEl.classList.add('hidden'); input.value='';
+  history=[]; attempts=0; resultEl.classList.add('hidden'); input.value='';
   guide.classList.remove('locked','detect'); $('againBtn').classList.add('hidden');
   scanning=true; setStatus('Line the plate up inside the rectangle.'); loop();
 });
@@ -210,20 +210,28 @@ $('startBtn').addEventListener('click', async ()=>{
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && stream){ video.play().catch(()=>{}); if(scanning) loop(); } });
 
 /* ---------- Text recognition engine (runs on the phone) ---------- */
-let workerPromise=null;
+let workerPromise=null, readerState='idle', readerMsg='', readerError='';
 function getWorker(){
   if(!workerPromise){
-    if(!window.Tesseract){ workerPromise=Promise.reject(new Error('reader not loaded')); return workerPromise; }
+    if(!window.Tesseract){
+      readerState='failed'; readerError='reader script didn’t download';
+      workerPromise=Promise.reject(new Error(readerError)); workerPromise.catch(()=>{}); return workerPromise;
+    }
+    readerState='loading'; readerMsg='Loading plate reader…';
     workerPromise=(async()=>{
-      const w=await Tesseract.createWorker('eng', 1);
+      const w=await Tesseract.createWorker('eng', 1, {
+        logger: m => { if(readerState==='loading' && m && typeof m.progress==='number')
+          readerMsg='Loading plate reader ('+Math.round(m.progress*100)+'%)…'; }
+      });
       await w.setParameters({
         tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
         tessedit_pageseg_mode:'7',
         user_defined_dpi:'300'
       });
+      readerState='ready';
       return w;
     })();
-    workerPromise.catch(()=>setStatus('The plate reader didn’t load. Check signal and reopen the app, or type plates manually.'));
+    workerPromise.catch(err=>{ readerState='failed'; readerError=String(err&&err.message||err); });
   }
   return workerPromise;
 }
@@ -256,7 +264,7 @@ function findChars(bin,W,H){
     comps.push({x0,y0,x1,y1,w:x1-x0+1,h:y1-y0+1,area}); next++;
   }
   const cand=comps.filter(c =>
-    c.h>=H*0.25 && c.h<=H*0.95 && c.w>=W*0.01 && c.w<=W*0.25 && c.w<=c.h*1.2 &&
+    c.h>=H*0.16 && c.h<=H*0.95 && c.w>=W*0.01 && c.w<=W*0.25 && c.w<=c.h*1.2 &&
     c.area/(c.w*c.h)>0.12 && c.area/(c.w*c.h)<0.95 &&
     c.x0>0 && c.y0>0 && c.x1<W-1 && c.y1<H-1);
   let group=[];
@@ -296,17 +304,24 @@ function detect(){
   // Bounding box around the characters, mapped back to full camera resolution
   let x0=W,y0=H,x1=0,y1=0;
   for(const c of best.group){ x0=Math.min(x0,c.x0); y0=Math.min(y0,c.y0); x1=Math.max(x1,c.x1); y1=Math.max(y1,c.y1); }
-  const pad=(y1-y0)*0.25, kx=sw/W, ky=sh/H;
-  return {group:best.group, dark, src:{
-    x:sx+Math.max(0,x0-pad)*kx, y:sy+Math.max(0,y0-pad)*ky,
-    w:(Math.min(W,x1+pad)-Math.max(0,x0-pad))*kx, h:(Math.min(H,y1+pad)-Math.max(0,y0-pad))*ky }};
+  const kx=sw/W, ky=sh/H, padY=(y1-y0)*0.12;
+  // Each character's position in full camera resolution, sharing one top and bottom line
+  const top=sy+Math.max(0,y0-padY)*ky, bottom=sy+Math.min(H,y1+1+padY)*ky;
+  const chars=best.group.map(c=>({x:sx+Math.max(0,c.x0-1)*kx, w:(c.w+2)*kx}));
+  return {group:best.group, dark, src:{top, h:bottom-top, chars}};
 }
 
+// Builds a clean image of just the plate characters, evenly spaced, so gaps,
+// dots, emblems and borders on the plate don't confuse the reader
 function prepareCrop(src, dark){
-  const targetH=110, scale=targetH/src.h, cw=Math.round(src.w*scale);
-  crop.width=cw; crop.height=targetH;
-  cctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, cw, targetH);
-  const img=cctx.getImageData(0,0,cw,targetH), d=img.data, gray=new Uint8Array(cw*targetH);
+  const targetH=100, scale=targetH/src.h, gap=Math.round(targetH*0.22), margin=24;
+  const widths=src.chars.map(c=>Math.max(4,Math.round(c.w*scale)));
+  const totalW=widths.reduce((a,b)=>a+b,0)+gap*(widths.length-1);
+  crop.width=totalW; crop.height=targetH;
+  cctx.fillStyle=dark?'#fff':'#000'; cctx.fillRect(0,0,totalW,targetH);
+  let x=0;
+  src.chars.forEach((c,i)=>{ cctx.drawImage(video, c.x, src.top, c.w, src.h, x, 0, widths[i], targetH); x+=widths[i]+gap; });
+  const img=cctx.getImageData(0,0,totalW,targetH), d=img.data, gray=new Uint8Array(totalW*targetH);
   for(let i=0;i<gray.length;i++) gray[i]=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0;
   const thr=otsu(gray);
   for(let i=0;i<gray.length;i++){
@@ -314,18 +329,21 @@ function prepareCrop(src, dark){
     const v=isText?0:255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
   }
   cctx.putImageData(img,0,0);
-  // white margin helps the reader
-  const out=document.createElement('canvas'); out.width=cw+40; out.height=targetH+40;
-  const o=out.getContext('2d'); o.fillStyle='#fff'; o.fillRect(0,0,out.width,out.height); o.drawImage(crop,20,20);
+  const out=document.createElement('canvas'); out.width=totalW+margin*2; out.height=targetH+margin*2;
+  const o=out.getContext('2d'); o.fillStyle='#fff'; o.fillRect(0,0,out.width,out.height); o.drawImage(crop,margin,margin);
   if(!debugCanvas.classList.contains('hidden')){ debugCanvas.width=out.width; debugCanvas.height=out.height; debugCanvas.getContext('2d').drawImage(out,0,0); }
   return out;
 }
 
 async function recognise(canvas){
   const w=await getWorker();
-  const {data}=await w.recognize(canvas);
-  return {text:cleanPlate(data.text), conf:data.confidence||0};
+  const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error('reading timed out')),8000));
+  const {data}=await Promise.race([w.recognize(canvas), timeout]);
+  return {text:cleanPlate(data.text), conf:Math.round(data.confidence||0), raw:String(data.text||'').trim()};
 }
+
+let attempts=0;
+function debugNote(t){ if(!debugCanvas.classList.contains('hidden')) $('settingsMsg').textContent=t; }
 
 function loop(){
   if(!scanning || document.hidden) return;
@@ -333,32 +351,49 @@ function loop(){
   if(f){
     const detected=!!f.src;
     guide.classList.toggle('detect', detected);
-    if(detected && !ocrBusy){
+    if(readerState==='failed'){
+      setStatus('The plate reader didn’t load ('+readerError+'). Close and reopen the app, or type the plate below.');
+    } else if(readerState!=='ready'){
+      setStatus(readerMsg||'Loading plate reader…');
+    } else if(detected && !ocrBusy){
       ocrBusy=true;
       const c=prepareCrop(f.src, f.dark);
       recognise(c).then(r=>{
         ocrBusy=false;
         if(!scanning) return;
-        if(r.text.length>=2 && r.text.length<=8 && r.conf>=55){
+        attempts++;
+        debugNote('Last reading: "'+r.raw+'" - confidence '+r.conf+'%');
+        if(r.text.length>=2 && r.text.length<=8 && r.conf>=30){
+          if(document.activeElement!==input) input.value=r.text;
           setStatus('Reading '+r.text+'…');
-          history.push(r.text); if(history.length>4) history.shift();
-          if(history.filter(t=>t===r.text).length>=2) lock(r.text);
+          history.push(r.text); if(history.length>6) history.shift();
+          const same=history.filter(t=>t===r.text).length;
+          if(same>=2 || r.conf>=80) return lock(r.text);
+        } else {
+          setStatus('Plate found - reading…');
         }
-      }).catch(()=>{ ocrBusy=false; });
+        if(attempts>=6 && history.length){
+          const counts={}; history.forEach(t=>counts[t]=(counts[t]||0)+1);
+          const best=Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0];
+          lock(best);
+        }
+      }).catch(err=>{ ocrBusy=false; setStatus('Reading failed ('+(err&&err.message||'error')+') - trying again…'); });
+    } else if(!detected && !ocrBusy){
+      setStatus('Line the plate up inside the rectangle.');
     }
-    if(!detected && !ocrBusy) setStatus('Line the plate up inside the rectangle.');
   }
   setTimeout(loop,150);
 }
 
 function lock(text){
-  scanning=false; guide.classList.add('locked');
+  scanning=false; attempts=0; guide.classList.add('locked');
   input.value=text; setStatus('Read '+text+'. Check it matches the plate - correct it below if not.');
   $('againBtn').classList.remove('hidden');
   showResult(text);
 }
 
 if(!getKey()) setStatus('First time on this device? Enter the access key in Settings below.');
+getWorker();
 })();
 </script>
 </body>
