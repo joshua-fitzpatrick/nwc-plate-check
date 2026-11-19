@@ -72,7 +72,7 @@ dt{color:var(--muted)} dd{margin:0;font-weight:600}
 .note{font-size:.88rem;color:var(--muted);margin:10px 0 0}
 details{margin-top:18px;color:var(--muted);font-size:.92rem}
 summary{cursor:pointer;padding:6px 0}
-#debug{width:100%;margin-top:8px;border-radius:8px;background:#fff}
+#debug,#debugRoi{width:100%;margin-top:8px;border-radius:8px;background:#fff}
 .hidden{display:none}
 </style>
 </head>
@@ -108,6 +108,7 @@ summary{cursor:pointer;padding:6px 0}
     <div class="row"><button class="secondary" id="testBtn">Test connection</button></div>
     <p class="note" id="settingsMsg"></p>
     <p class="note"><label><input type="checkbox" id="debugToggle"> Show what the reader sees</label></p>
+    <canvas id="debugRoi" class="hidden"></canvas>
     <canvas id="debug" class="hidden"></canvas>
   </details>
 </main>
@@ -165,7 +166,7 @@ async function showResult(plate){
     html+='<div class="verdict yes">Permit issued: YES</div><dl><dt>Parking area</dt><dd>'+esc(r.area)+'</dd><dt>Permit owner</dt><dd>'+esc(r.owner)+'</dd></dl>';
     if(!r.exact) html+='<p class="note">Matched registration <strong>'+esc(r.plate)+'</strong> (letters and numbers that look alike, such as O and 0). Check the plate on the car is '+esc(r.plate)+' before relying on this.</p>';
   } else {
-    html+='<div class="verdict no">Permit issued: NO</div><dl><dt>Parking area</dt><dd>N/A</dd><dt>Permit owner</dt><dd>N/A</dd></dl><p class="note">If the reading is wrong, correct it above and tap Check.</p>';
+    html+='<div class="verdict no">Permit issued: NO</div><dl><dt>Parking area</dt><dd>N/A</dd><dt>Permit owner</dt><dd>N/A</dd></dl><p class="note">If the reading is wrong or has fewer characters than the plate, correct it above and tap Check, or tap Scan next plate and try again.</p>';
   }
   resultEl.innerHTML=html;
 }
@@ -182,7 +183,7 @@ $('testBtn').addEventListener('click', async ()=>{
   const r=await callApi({ping:'1'});
   $('settingsMsg').textContent = r.ok ? 'Connected to the permit list.' : (ERRORS[r.error]||'Connection failed.');
 });
-$('debugToggle').addEventListener('change', e=>debugCanvas.classList.toggle('hidden', !e.target.checked));
+$('debugToggle').addEventListener('change', e=>{ debugCanvas.classList.toggle('hidden', !e.target.checked); $('debugRoi').classList.toggle('hidden', !e.target.checked); });
 $('againBtn').addEventListener('click', ()=>{
   history=[]; attempts=0; resultEl.classList.add('hidden'); input.value='';
   guide.classList.remove('locked','detect'); $('againBtn').classList.add('hidden');
@@ -261,21 +262,69 @@ function findChars(bin,W,H){
         const q=ny*W+nx; if(bin[q]&&!labels[q]){ labels[q]=next; stack.push(q); }
       }
     }
-    comps.push({x0,y0,x1,y1,w:x1-x0+1,h:y1-y0+1,area}); next++;
+    comps.push({id:next,x0,y0,x1,y1,w:x1-x0+1,h:y1-y0+1,area}); next++;
   }
+  const inside=c=>c.x0>0 && c.y0>0 && c.x1<W-1 && c.y1<H-1;
+  const fill=c=>c.area/(c.w*c.h);
   const cand=comps.filter(c =>
     c.h>=H*0.16 && c.h<=H*0.95 && c.w>=W*0.01 && c.w<=W*0.25 && c.w<=c.h*1.2 &&
-    c.area/(c.w*c.h)>0.12 && c.area/(c.w*c.h)<0.95 &&
-    c.x0>0 && c.y0>0 && c.x1<W-1 && c.y1<H-1);
+    fill(c)>0.12 && fill(c)<0.95 && inside(c));
+  const sameLine=(c,s)=>Math.abs(c.h-s.h)<0.3*s.h && Math.abs((c.y0+c.y1)/2-(s.y0+s.y1)/2)<0.3*s.h;
   let group=[];
   for(const s of cand){
-    const g=cand.filter(c=>Math.abs(c.h-s.h)<0.2*s.h && Math.abs((c.y0+c.y1)/2-(s.y0+s.y1)/2)<0.3*s.h);
+    const g=cand.filter(c=>sameLine(c,s));
     if(g.length>group.length) group=g;
+  }
+  if(group.length>=2){
+    // Characters that have run together (e.g. "33") show up as one wide shape - split them
+    const ws=group.map(c=>c.w).sort((a,b)=>a-b), mw=ws[ws.length>>1];
+    const hs=group.map(c=>c.h).sort((a,b)=>a-b), ref={h:hs[hs.length>>1], y0:0, y1:0};
+    const ys=group.map(c=>(c.y0+c.y1)/2).sort((a,b)=>a-b); ref.y0=ys[ys.length>>1]-ref.h/2; ref.y1=ref.y0+ref.h;
+    const wide=comps.filter(c=>inside(c) && c.w>1.3*mw && c.w<5*mw && c.w>c.h*1.0 && sameLine(c,ref) && !group.includes(c));
+    for(const c of wide){
+      const gap=0.2*mw, n=Math.max(2,Math.min(5,Math.round((c.w+gap)/(mw+gap))));
+      const col=new Array(c.w).fill(0);
+      for(let y=c.y0;y<=c.y1;y++) for(let x=c.x0;x<=c.x1;x++) if(labels[y*W+x]===c.id) col[x-c.x0]++;
+      const cuts=[];
+      for(let k=1;k<n;k++){
+        const e=Math.round(k*c.w/n), r=Math.max(1,Math.round(c.w/n*0.3));
+        let bx=e, bv=Infinity;
+        for(let x=Math.max(1,e-r); x<=Math.min(c.w-2,e+r); x++) if(col[x]<bv){ bv=col[x]; bx=x; }
+        cuts.push(bx);
+      }
+      let start=0;
+      for(const cut of cuts.concat([c.w])){
+        if(cut-start>=2) group.push({x0:c.x0+start,x1:c.x0+cut-1,y0:c.y0,y1:c.y1,w:cut-start,h:c.h,area:0,split:true});
+        start=cut;
+      }
+    }
   }
   group.sort((a,b)=>a.x0-b.x0);
   return {cand, group};
 }
 
+function adaptiveBin(gray,W,H,darkText,C){
+  const S=Math.max(9,Math.round(H*0.5)), half=S>>1, W1=W+1, ii=new Uint32Array(W1*(H+1));
+  for(let y=0;y<H;y++){ let row=0; for(let x=0;x<W;x++){ row+=gray[y*W+x]; ii[(y+1)*W1+x+1]=ii[y*W1+x+1]+row; } }
+  const bin=new Uint8Array(W*H);
+  for(let y=0;y<H;y++){
+    const ya=Math.max(0,y-half), yb=Math.min(H,y+half+1);
+    for(let x=0;x<W;x++){
+      const xa=Math.max(0,x-half), xb=Math.min(W,x+half+1);
+      const sum=ii[yb*W1+xb]-ii[ya*W1+xb]-ii[yb*W1+xa]+ii[ya*W1+xa], mean=sum/((yb-ya)*(xb-xa));
+      const v=gray[y*W+x]; bin[y*W+x]= darkText ? (v<mean-C) : (v>mean+C);
+    }
+  }
+  return bin;
+}
+
+function drawRoiDebug(bin,W,H,group){
+  const el=$('debugRoi'); if(!el || debugCanvas.classList.contains('hidden') || !bin) return;
+  el.width=W; el.height=H; const g=el.getContext('2d'), img=g.createImageData(W,H);
+  for(let i=0;i<W*H;i++){ const v=bin[i]?0:255; img.data[i*4]=img.data[i*4+1]=img.data[i*4+2]=v; img.data[i*4+3]=255; }
+  g.putImageData(img,0,0); g.lineWidth=2; g.strokeStyle='#2fbf5b';
+  for(const c of group) g.strokeRect(c.x0,c.y0,c.w,c.h);
+}
 const work=document.createElement('canvas'), wctx=work.getContext('2d',{willReadFrequently:true});
 const crop=document.createElement('canvas'), cctx=crop.getContext('2d',{willReadFrequently:true});
 
@@ -291,14 +340,16 @@ function detect(){
   let mn=255,mx=0;
   for(let i=0;i<W*H;i++){ const v=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0; gray[i]=v; if(v<mn)mn=v; if(v>mx)mx=v; }
   if(mx-mn<50) return {group:[]};
-  const thr=otsu(gray);
-  let best=null, dark=true;
+  const thr=otsu(gray), C=Math.max(8,(mx-mn)*0.08);
+  let best=null, dark=true, bestBin=null;
   for(const darkText of [true,false]){
-    const bin=new Uint8Array(W*H); for(let i=0;i<W*H;i++) bin[i]=darkText ? gray[i]<thr : gray[i]>thr;
-    const r=findChars(bin,W,H);
-    if(!best || r.group.length>best.group.length){ best=r; dark=darkText; }
-    if(r.group.length>=3) break;
+    for(const mode of ['adaptive','global']){
+      const bin = mode==='adaptive' ? adaptiveBin(gray,W,H,darkText,C) : (()=>{ const b=new Uint8Array(W*H); for(let i=0;i<W*H;i++) b[i]=darkText ? gray[i]<thr : gray[i]>thr; return b; })();
+      const r=findChars(bin,W,H);
+      if(!best || r.group.length>best.group.length){ best=r; dark=darkText; bestBin=bin; }
+    }
   }
+  drawRoiDebug(bestBin,W,H,best.group);
   const ok=best.group.length>=2 && best.group.length<=9;
   if(!ok) return {group:best.group};
   // Bounding box around the characters, mapped back to full camera resolution
@@ -368,13 +419,13 @@ function loop(){
           setStatus('Reading '+r.text+'…');
           history.push(r.text); if(history.length>6) history.shift();
           const same=history.filter(t=>t===r.text).length;
-          if(same>=2 || r.conf>=80) return lock(r.text);
+          if(same>=2) return lock(r.text);
         } else {
           setStatus('Plate found - reading…');
         }
         if(attempts>=6 && history.length){
           const counts={}; history.forEach(t=>counts[t]=(counts[t]||0)+1);
-          const best=Object.keys(counts).sort((a,b)=>counts[b]-counts[a])[0];
+          const best=Object.keys(counts).sort((a,b)=>(counts[b]-counts[a])||(b.length-a.length))[0];
           lock(best);
         }
       }).catch(err=>{ ocrBusy=false; setStatus('Reading failed ('+(err&&err.message||'error')+') - trying again…'); });
