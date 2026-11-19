@@ -303,6 +303,25 @@ function findChars(bin,W,H){
   return {cand, group};
 }
 
+// Prefers groups of plate-sized character counts made of whole (not split) shapes
+function groupScore(group){
+  if(group.length<2 || group.length>9) return 0;
+  return group.reduce((t,c)=>t+(c.split?0.6:1),0);
+}
+
+// Erases long horizontal lines (plate border/frame) so characters touching them separate
+function removeLines(bin,W,H,minRun){
+  for(let y=0;y<H;y++){
+    let x=0;
+    while(x<W){
+      if(!bin[y*W+x]){ x++; continue; }
+      let e=x; while(e<W && bin[y*W+e]) e++;
+      if(e-x>=minRun) for(let k=x;k<e;k++) bin[y*W+k]=0;
+      x=e;
+    }
+  }
+}
+
 function adaptiveBin(gray,W,H,darkText,C){
   const S=Math.max(9,Math.round(H*0.5)), half=S>>1, W1=W+1, ii=new Uint32Array(W1*(H+1));
   for(let y=0;y<H;y++){ let row=0; for(let x=0;x<W;x++){ row+=gray[y*W+x]; ii[(y+1)*W1+x+1]=ii[y*W1+x+1]+row; } }
@@ -339,27 +358,29 @@ function detect(){
   const d=wctx.getImageData(0,0,W,H).data, gray=new Uint8Array(W*H);
   let mn=255,mx=0;
   for(let i=0;i<W*H;i++){ const v=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0; gray[i]=v; if(v<mn)mn=v; if(v>mx)mx=v; }
-  if(mx-mn<50) return {group:[]};
+  if(mx-mn<50) return {group:[], cands:[]};
   const thr=otsu(gray), C=Math.max(8,(mx-mn)*0.08);
-  let best=null, dark=true, bestBin=null;
+  const kx=sw/W, ky=sh/H, cands=[];
   for(const darkText of [true,false]){
+    let best=null;
     for(const mode of ['adaptive','global']){
       const bin = mode==='adaptive' ? adaptiveBin(gray,W,H,darkText,C) : (()=>{ const b=new Uint8Array(W*H); for(let i=0;i<W*H;i++) b[i]=darkText ? gray[i]<thr : gray[i]>thr; return b; })();
-      const r=findChars(bin,W,H);
-      if(!best || r.group.length>best.group.length){ best=r; dark=darkText; bestBin=bin; }
+      removeLines(bin,W,H,Math.round(H*0.7));
+      const r=findChars(bin,W,H); r.score=groupScore(r.group); r.bin=bin;
+      if(!best || r.score>best.score) best=r;
+    }
+    if(best.score>=2){
+      let x0=W,y0=H,x1=0,y1=0;
+      for(const c of best.group){ x0=Math.min(x0,c.x0); y0=Math.min(y0,c.y0); x1=Math.max(x1,c.x1); y1=Math.max(y1,c.y1); }
+      const padY=(y1-y0)*0.06;
+      const top=sy+Math.max(0,y0-padY)*ky, bottom=sy+Math.min(H,y1+1+padY)*ky;
+      const chars=best.group.map(c=>({x:sx+Math.max(0,c.x0-1)*kx, w:(c.w+2)*kx}));
+      cands.push({dark:darkText, group:best.group, bin:best.bin, W, H, score:best.score, src:{top, h:bottom-top, chars}});
     }
   }
-  drawRoiDebug(bestBin,W,H,best.group);
-  const ok=best.group.length>=2 && best.group.length<=9;
-  if(!ok) return {group:best.group};
-  // Bounding box around the characters, mapped back to full camera resolution
-  let x0=W,y0=H,x1=0,y1=0;
-  for(const c of best.group){ x0=Math.min(x0,c.x0); y0=Math.min(y0,c.y0); x1=Math.max(x1,c.x1); y1=Math.max(y1,c.y1); }
-  const kx=sw/W, ky=sh/H, padY=(y1-y0)*0.12;
-  // Each character's position in full camera resolution, sharing one top and bottom line
-  const top=sy+Math.max(0,y0-padY)*ky, bottom=sy+Math.min(H,y1+1+padY)*ky;
-  const chars=best.group.map(c=>({x:sx+Math.max(0,c.x0-1)*kx, w:(c.w+2)*kx}));
-  return {group:best.group, dark, src:{top, h:bottom-top, chars}};
+  cands.sort((a,b)=>b.score-a.score);
+  if(cands[0]) drawRoiDebug(cands[0].bin,W,H,cands[0].group);
+  return {group:cands[0]?cands[0].group:[], cands};
 }
 
 // Builds a clean image of just the plate characters, evenly spaced, so gaps,
@@ -379,10 +400,10 @@ function prepareCrop(src, dark){
     const isText = dark ? gray[i]<thr : gray[i]>thr;
     const v=isText?0:255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
   }
+  cleanStrip(d,totalW,targetH,widths,gap);
   cctx.putImageData(img,0,0);
   const out=document.createElement('canvas'); out.width=totalW+margin*2; out.height=targetH+margin*2;
   const o=out.getContext('2d'); o.fillStyle='#fff'; o.fillRect(0,0,out.width,out.height); o.drawImage(crop,margin,margin);
-  if(!debugCanvas.classList.contains('hidden')){ debugCanvas.width=out.width; debugCanvas.height=out.height; debugCanvas.getContext('2d').drawImage(out,0,0); }
   return out;
 }
 
@@ -400,7 +421,7 @@ function loop(){
   if(!scanning || document.hidden) return;
   const f=detect();
   if(f){
-    const detected=!!f.src;
+    const detected=f.cands.length>0;
     guide.classList.toggle('detect', detected);
     if(readerState==='failed'){
       setStatus('The plate reader didn’t load ('+readerError+'). Close and reopen the app, or type the plate below.');
@@ -408,11 +429,22 @@ function loop(){
       setStatus(readerMsg||'Loading plate reader…');
     } else if(detected && !ocrBusy){
       ocrBusy=true;
-      const c=prepareCrop(f.src, f.dark);
-      recognise(c).then(r=>{
+      // Read each candidate (light-on-dark and dark-on-light) and keep the most convincing
+      (async()=>{
+        let win=null;
+        for(const cand of f.cands){
+          const canvas=prepareCrop(cand.src, cand.dark);
+          const r=await recognise(canvas); r.canvas=canvas;
+          const valid=r.text.length>=2 && r.text.length<=8;
+          r.rank=valid ? r.conf+3*r.text.length : -1;
+          if(!win || r.rank>win.rank) win=r;
+        }
+        return win;
+      })().then(r=>{
         ocrBusy=false;
-        if(!scanning) return;
+        if(!scanning || !r) return;
         attempts++;
+        if(!debugCanvas.classList.contains('hidden')){ debugCanvas.width=r.canvas.width; debugCanvas.height=r.canvas.height; debugCanvas.getContext('2d').drawImage(r.canvas,0,0); }
         debugNote('Last reading: "'+r.raw+'" - confidence '+r.conf+'%');
         if(r.text.length>=2 && r.text.length<=8 && r.conf>=30){
           if(document.activeElement!==input) input.value=r.text;
