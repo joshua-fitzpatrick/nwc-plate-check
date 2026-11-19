@@ -264,6 +264,22 @@ function findChars(bin,W,H){
     }
     comps.push({id:next,x0,y0,x1,y1,w:x1-x0+1,h:y1-y0+1,area}); next++;
   }
+  // Re-join pieces of one character split by a shadow edge or glare (one above the other)
+  let merged=true;
+  while(merged){
+    merged=false;
+    for(let i=0;i<comps.length && !merged;i++) for(let j=i+1;j<comps.length && !merged;j++){
+      const a=comps[i], b=comps[j];
+      if(a.h<H*0.05||b.h<H*0.05) continue;
+      const ov=Math.min(a.x1,b.x1)-Math.max(a.x0,b.x0)+1, narrow=Math.min(a.w,b.w);
+      const gapY=Math.max(a.y0,b.y0)-Math.min(a.y1,b.y1)-1;
+      if(ov>=narrow*0.6 && gapY<=H*0.12 && Math.max(a.w,b.w)<=Math.min(a.w,b.w)*2.2){
+        const m={id:a.id,ids:(a.ids||[a.id]).concat(b.ids||[b.id]),x0:Math.min(a.x0,b.x0),y0:Math.min(a.y0,b.y0),x1:Math.max(a.x1,b.x1),y1:Math.max(a.y1,b.y1),area:a.area+b.area};
+        m.w=m.x1-m.x0+1; m.h=m.y1-m.y0+1;
+        comps.splice(j,1); comps[i]=m; merged=true;
+      }
+    }
+  }
   const inside=c=>c.x0>0 && c.y0>0 && c.x1<W-1 && c.y1<H-1;
   const fill=c=>c.area/(c.w*c.h);
   const cand=comps.filter(c =>
@@ -284,7 +300,7 @@ function findChars(bin,W,H){
     for(const c of wide){
       const gap=0.2*mw, n=Math.max(2,Math.min(5,Math.round((c.w+gap)/(mw+gap))));
       const col=new Array(c.w).fill(0);
-      for(let y=c.y0;y<=c.y1;y++) for(let x=c.x0;x<=c.x1;x++) if(labels[y*W+x]===c.id) col[x-c.x0]++;
+      for(let y=c.y0;y<=c.y1;y++) for(let x=c.x0;x<=c.x1;x++) if(c.ids?c.ids.includes(labels[y*W+x]):labels[y*W+x]===c.id) col[x-c.x0]++;
       const cuts=[];
       for(let k=1;k<n;k++){
         const e=Math.round(k*c.w/n), r=Math.max(1,Math.round(c.w/n*0.3));
@@ -307,6 +323,26 @@ function findChars(bin,W,H){
 function groupScore(group){
   if(group.length<2 || group.length>9) return 0;
   return group.reduce((t,c)=>t+(c.split?0.6:1),0);
+}
+
+// Evens out shade and glare: compares each pixel with the brightest background nearby,
+// so a shadow across part of the plate doesn't swallow the characters.
+// Returns an image where text is dark, whatever the plate colours.
+function evenLight(gray,W,H,darkText,k){
+  const src=new Uint8Array(W*H);
+  for(let i=0;i<W*H;i++) src[i]=darkText?gray[i]:255-gray[i];
+  const half=Math.max(2,k>>1), tmp=new Uint8Array(W*H), bg=new Uint8Array(W*H);
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    let m=0; const a=Math.max(0,x-half), b=Math.min(W-1,x+half);
+    for(let xx=a;xx<=b;xx++){ const v=src[y*W+xx]; if(v>m) m=v; } tmp[y*W+x]=m;
+  }
+  for(let y=0;y<H;y++) for(let x=0;x<W;x++){
+    let m=0; const a=Math.max(0,y-half), b=Math.min(H-1,y+half);
+    for(let yy=a;yy<=b;yy++){ const v=tmp[yy*W+x]; if(v>m) m=v; } bg[y*W+x]=m;
+  }
+  const out=new Uint8Array(W*H);
+  for(let i=0;i<W*H;i++) out[i]=Math.min(255, Math.round(src[i]*255/Math.max(bg[i],1)));
+  return out;
 }
 
 // Erases long horizontal lines (plate border/frame) so characters touching them separate
@@ -363,8 +399,12 @@ function detect(){
   const kx=sw/W, ky=sh/H, cands=[];
   for(const darkText of [true,false]){
     let best=null;
-    for(const mode of ['adaptive','global']){
-      const bin = mode==='adaptive' ? adaptiveBin(gray,W,H,darkText,C) : (()=>{ const b=new Uint8Array(W*H); for(let i=0;i<W*H;i++) b[i]=darkText ? gray[i]<thr : gray[i]>thr; return b; })();
+    for(const mode of ['even','adaptive','global']){
+      let bin;
+      if(mode==='even'){
+        const ev=evenLight(gray,W,H,darkText,Math.round(H*0.2)), t=otsu(ev);
+        bin=new Uint8Array(W*H); for(let i=0;i<W*H;i++) bin[i]=ev[i]<t;
+      } else bin = mode==='adaptive' ? adaptiveBin(gray,W,H,darkText,C) : (()=>{ const b=new Uint8Array(W*H); for(let i=0;i<W*H;i++) b[i]=darkText ? gray[i]<thr : gray[i]>thr; return b; })();
       removeLines(bin,W,H,Math.round(H*0.7));
       const r=findChars(bin,W,H); r.score=groupScore(r.group); r.bin=bin;
       if(!best || r.score>best.score) best=r;
@@ -386,10 +426,10 @@ function detect(){
 function cleanStrip(d,W,H,widths,gap){
   const on=i=>d[i*4]===0;
   const off=i=>{ d[i*4]=d[i*4+1]=d[i*4+2]=255; };
-  // a row filled across (almost) the whole slot is a border sliver, not part of a character
+  // a row near the top or bottom filled across the whole slot is a frame sliver, not part of a character
   let x0=0;
   for(const w of widths){
-    for(let y=0;y<H;y++){ let n=0; for(let x=x0;x<x0+w;x++) if(on(y*W+x)) n++; if(n>=w*0.97) for(let x=x0;x<x0+w;x++) off(y*W+x); }
+    for(let y=0;y<H;y++){ if(y>H*0.15 && y<H*0.85) continue; let n=0; for(let x=x0;x<x0+w;x++) if(on(y*W+x)) n++; if(n>=w*0.97) for(let x=x0;x<x0+w;x++) off(y*W+x); }
     x0+=w+gap;
   }
   // drop small marks (bolts, dots, slivers) - keep shapes at least 35% of the strip height
@@ -414,10 +454,9 @@ function prepareCrop(src, dark){
   src.chars.forEach((c,i)=>{ cctx.drawImage(video, c.x, src.top, c.w, src.h, x, 0, widths[i], targetH); x+=widths[i]+gap; });
   const img=cctx.getImageData(0,0,totalW,targetH), d=img.data, gray=new Uint8Array(totalW*targetH);
   for(let i=0;i<gray.length;i++) gray[i]=(d[i*4]*0.299+d[i*4+1]*0.587+d[i*4+2]*0.114)|0;
-  const thr=otsu(gray);
+  const ev=evenLight(gray,totalW,targetH,dark,Math.round(targetH*0.35)), thr=otsu(ev);
   for(let i=0;i<gray.length;i++){
-    const isText = dark ? gray[i]<thr : gray[i]>thr;
-    const v=isText?0:255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
+    const v=ev[i]<thr?0:255; d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
   }
   cleanStrip(d,totalW,targetH,widths,gap);
   cctx.putImageData(img,0,0);
@@ -430,7 +469,9 @@ async function recognise(canvas){
   const w=await getWorker();
   const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error('reading timed out')),8000));
   const {data}=await Promise.race([w.recognize(canvas), timeout]);
-  return {text:cleanPlate(data.text), conf:Math.round(data.confidence||0), raw:String(data.text||'').trim()};
+  let conf=data.confidence||0;
+  if(!conf && data.words && data.words.length) conf=data.words.reduce((t,w)=>t+(w.confidence||0),0)/data.words.length;
+  return {text:cleanPlate(data.text), conf:Math.round(conf), raw:String(data.text||'').trim()};
 }
 
 let attempts=0;
@@ -465,12 +506,15 @@ function loop(){
         attempts++;
         if(!debugCanvas.classList.contains('hidden')){ debugCanvas.width=r.canvas.width; debugCanvas.height=r.canvas.height; debugCanvas.getContext('2d').drawImage(r.canvas,0,0); }
         debugNote('Last reading: "'+r.raw+'" - confidence '+r.conf+'%');
-        if(r.text.length>=2 && r.text.length<=8 && r.conf>=30){
+        if(r.text.length>=2 && r.text.length<=8){
           if(document.activeElement!==input) input.value=r.text;
           setStatus('Reading '+r.text+'…');
           history.push(r.text); if(history.length>6) history.shift();
           const same=history.filter(t=>t===r.text).length;
-          if(same>=2) return lock(r.text);
+          if(same>=2){
+            const longer=history.filter(t=>t.length>r.text.length && t.indexOf(r.text)>=0).sort((a,b)=>b.length-a.length)[0];
+            return lock(longer||r.text);
+          }
         } else {
           setStatus('Plate found - reading…');
         }
